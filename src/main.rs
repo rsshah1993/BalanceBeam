@@ -71,8 +71,6 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
-    /// dead addresses
-    dead_addresses: Vec<String>,
 }
 #[tokio::main]
 async fn main() {
@@ -107,7 +105,6 @@ async fn main() {
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
-        dead_addresses: Vec::new(),
     };
 
     // channels to communicate failover for passive health checks
