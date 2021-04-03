@@ -2,11 +2,14 @@ mod request;
 mod response;
 
 use clap::Clap;
+use crossbeam_channel;
+use crossbeam_channel::Sender;
 use rand::{Rng, SeedableRng};
-use tokio::{net::{TcpListener, TcpStream}, stream::StreamExt};
 use tokio::task;
-use tokio::sync::RwLock;
-use std::sync::Arc;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    stream::StreamExt,
+};
 // use threadpool::ThreadPool;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -47,11 +50,8 @@ struct CmdOptions {
         default_value = "10"
     )]
     num_threads: usize,
-    #[clap(
-        long,
-        about = "Run with multiple threads",
-    )]
-    run_threaded: bool
+    #[clap(long, about = "Run with multiple threads")]
+    run_threaded: bool,
 }
 
 /// Contains information about the state of balancebeam (e.g. what servers we are currently proxying
@@ -71,7 +71,7 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
-    /// dead addresses 
+    /// dead addresses
     dead_addresses: Vec<String>,
 }
 #[tokio::main]
@@ -102,47 +102,61 @@ async fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let state = Arc::new(RwLock::new(ProxyState {
+    let mut state = ProxyState {
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
         dead_addresses: Vec::new(),
-    }));
+    };
+
+    // channels to communicate failover for passive health checks
+    let (sender, receiver) = crossbeam_channel::unbounded();
 
     // async with multiple "threads" (tasks)
-    while let Some(stream) = listener.next().await{
+    while let Some(stream) = listener.next().await {
+        println!("Incoming request!!!!");
         if let Ok(stream) = stream {
             let state = state.clone();
+            let sender = sender.clone();
             task::spawn(async move {
-                handle_connection(stream, state).await;
+                handle_connection(stream, state, sender).await;
             });
         }
-    }
-
-}
-
-async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream, request::Error> {
-    if state.read().await.upstream_addresses.is_empty(){
-        log::error!("No Upstream connections available");
-        return Err(request::Error::UpstreamServerUnavailable)
-    }
-    while !state.read().await.upstream_addresses.is_empty() {
-        let mut rng = rand::rngs::StdRng::from_entropy();
-        let upstream_idx = rng.gen_range(0, state.read().await.upstream_addresses.len());
-        let upstream_ip = &state.read().await.upstream_addresses[upstream_idx];
-        let connection = TcpStream::connect(upstream_ip).await;
-        match connection {
-            Ok(connection) => return Ok(connection),
-            Error =>{
-                log::error!("Server {} is not returning a response, dropping from available servers", upstream_ip.to_string());
-                state.write().await.upstream_addresses.remove(upstream_idx);
+        if let Ok(dead_ip) = receiver.try_recv() {
+            log::debug!("Received dead IP index: {}", dead_ip);
+            println!("Upstream Addresses: {:?}", state.upstream_addresses);
+            let index = state.upstream_addresses.iter().position(|x| *x == dead_ip);
+            match index {
+                Some(index) => {
+                    state.upstream_addresses.remove(index);
+                }
+                None => (),
             }
         }
     }
-    Err(request::Error::UpstreamServerUnavailable)
 }
 
+async fn connect_to_upstream(
+    state: &mut ProxyState,
+    sender: Sender<String>,
+) -> Result<TcpStream, std::io::Error> {
+    log::debug!("State upstreams per thread: {:?}", state.upstream_addresses);
+    let mut rng = rand::rngs::StdRng::from_entropy();
+    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
+    let upstream_ip = { &state.upstream_addresses[upstream_idx] };
+    let connection = TcpStream::connect(upstream_ip).await;
+    match connection {
+        Ok(connection) => Ok(connection),
+        Err(error) => {
+            log::error!("Failed to connect to upstream {}: {}", upstream_ip, error);
+            let dead_ip_clone = upstream_ip.clone();
+            state.upstream_addresses.remove(upstream_idx);
+            sender.send(dead_ip_clone).unwrap();
+            Err(error)
+        }
+    }
+}
 
 async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
@@ -157,19 +171,32 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
     }
 }
 
-async fn handle_connection(mut client_conn: TcpStream, state: Arc<RwLock<ProxyState>>) {
+async fn handle_connection(
+    mut client_conn: TcpStream,
+    mut state: ProxyState,
+    sender: Sender<String>,
+) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
     // Open a connection to a random destination server
-    let mut upstream_conn = match connect_to_upstream(state).await {
-        Ok(stream) => stream,
-        Err(_error) => {
-            let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
-            send_response(&mut client_conn, &response).await;
-            return;
-        }
+    let upstream_conn = loop {
+        let stream = connect_to_upstream(&mut state, sender.clone()).await;
+        match stream {
+            Ok(stream) => break Ok(stream),
+            Err(_error) => {
+                if state.upstream_addresses.is_empty() {
+                    let response = response::make_http_error(http::StatusCode::BAD_GATEWAY);
+                    send_response(&mut client_conn, &response).await;
+                    break Err(_error);
+                } else {
+                    continue;
+                }
+            }
+        };
     };
+    let mut upstream_conn = upstream_conn.unwrap();
+
     let upstream_ip = client_conn.peer_addr().unwrap().ip().to_string();
 
     // The client may now send us one or more requests. Keep trying to read requests until the
@@ -229,7 +256,8 @@ async fn handle_connection(mut client_conn: TcpStream, state: Arc<RwLock<ProxySt
         log::debug!("Forwarded request to server");
 
         // Read the server's response
-        let response = match response::read_from_stream(&mut upstream_conn, request.method()).await {
+        let response = match response::read_from_stream(&mut upstream_conn, request.method()).await
+        {
             Ok(response) => response,
             Err(error) => {
                 log::error!("Error reading response from server: {:?}", error);
