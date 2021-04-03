@@ -5,6 +5,8 @@ use clap::Clap;
 use rand::{Rng, SeedableRng};
 use tokio::{net::{TcpListener, TcpStream}, stream::StreamExt};
 use tokio::task;
+use tokio::sync::RwLock;
+use std::sync::Arc;
 // use threadpool::ThreadPool;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -69,6 +71,8 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+    /// dead addresses 
+    dead_addresses: Vec<String>,
 }
 #[tokio::main]
 async fn main() {
@@ -98,49 +102,47 @@ async fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let state = ProxyState {
+    let state = Arc::new(RwLock::new(ProxyState {
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
-    };
-
-    // multi-threading for blocking i/o
-    // if options.run_threaded{
-    //     let pool = ThreadPool::new(options.num_threads);
-    //     for stream in listener.incoming() {
-    //         if let Ok(stream) = stream {
-    //             // Handle the connection!
-    //             let state = state.clone();
-    //             pool.execute(move || {
-    //                 handle_connection(stream, &state)
-    //             })
-    //         }
-    //     }
-    // }
+        dead_addresses: Vec::new(),
+    }));
 
     // async with multiple "threads" (tasks)
     while let Some(stream) = listener.next().await{
         if let Ok(stream) = stream {
             let state = state.clone();
             task::spawn(async move {
-                handle_connection(stream, &state).await;
+                handle_connection(stream, state).await;
             });
         }
     }
 
 }
 
-async fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
-    let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
-    TcpStream::connect(upstream_ip).await.or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
-    // TODO: implement failover (milestone 3)
+async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream, request::Error> {
+    if state.read().await.upstream_addresses.is_empty(){
+        log::error!("No Upstream connections available");
+        return Err(request::Error::UpstreamServerUnavailable)
+    }
+    while !state.read().await.upstream_addresses.is_empty() {
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let upstream_idx = rng.gen_range(0, state.read().await.upstream_addresses.len());
+        let upstream_ip = &state.read().await.upstream_addresses[upstream_idx];
+        let connection = TcpStream::connect(upstream_ip).await;
+        match connection {
+            Ok(connection) => return Ok(connection),
+            Error =>{
+                log::error!("Server {} is not returning a response, dropping from available servers", upstream_ip.to_string());
+                state.write().await.upstream_addresses.remove(upstream_idx);
+            }
+        }
+    }
+    Err(request::Error::UpstreamServerUnavailable)
 }
+
 
 async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
@@ -155,7 +157,7 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
     }
 }
 
-async fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
+async fn handle_connection(mut client_conn: TcpStream, state: Arc<RwLock<ProxyState>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
@@ -192,6 +194,7 @@ async fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
                     request::Error::IncompleteRequest(_)
                     | request::Error::MalformedRequest(_)
                     | request::Error::InvalidContentLength
+                    | request::Error::UpstreamServerUnavailable
                     | request::Error::ContentLengthMismatch => http::StatusCode::BAD_REQUEST,
                     request::Error::RequestBodyTooLarge => http::StatusCode::PAYLOAD_TOO_LARGE,
                     request::Error::ConnectionError(_) => http::StatusCode::SERVICE_UNAVAILABLE,
