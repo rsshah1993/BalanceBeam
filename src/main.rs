@@ -125,14 +125,21 @@ async fn main() {
         }
         if let Ok(dead_ip) = receiver.try_recv() {
             log::debug!("Received dead IP index: {}", dead_ip);
-            state.upstream_addresses.remove(dead_ip);
+            println!("Upstream Addresses: {:?}", state.upstream_addresses);
+            let index = state.upstream_addresses.iter().position(|x| *x == dead_ip);
+            match index {
+                Some(index) => {
+                    state.upstream_addresses.remove(index);
+                }
+                None => (),
+            }
         }
     }
 }
 
 async fn connect_to_upstream(
     state: &mut ProxyState,
-    sender: Sender<usize>,
+    sender: Sender<String>,
 ) -> Result<TcpStream, std::io::Error> {
     log::debug!("State upstreams per thread: {:?}", state.upstream_addresses);
     let mut rng = rand::rngs::StdRng::from_entropy();
@@ -143,8 +150,9 @@ async fn connect_to_upstream(
         Ok(connection) => Ok(connection),
         Err(error) => {
             log::error!("Failed to connect to upstream {}: {}", upstream_ip, error);
+            let dead_ip_clone = upstream_ip.clone();
             state.upstream_addresses.remove(upstream_idx);
-            sender.send(upstream_idx).unwrap();
+            sender.send(dead_ip_clone).unwrap();
             Err(error)
         }
     }
@@ -166,7 +174,7 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
 async fn handle_connection(
     mut client_conn: TcpStream,
     mut state: ProxyState,
-    sender: Sender<usize>,
+    sender: Sender<String>,
 ) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
