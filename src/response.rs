@@ -94,6 +94,7 @@ async fn read_headers(stream: &mut TcpStream) -> Result<http::Response<Vec<u8>>,
             .or_else(|err| Err(Error::ConnectionError(err)))?;
         if new_bytes == 0 {
             // We didn't manage to read a complete response
+            log::debug!("Could not read a complete response");
             return Err(Error::IncompleteResponse);
         }
         bytes_read += new_bytes;
@@ -165,6 +166,7 @@ pub async fn read_from_stream(
     request_method: &http::Method,
 ) -> Result<http::Response<Vec<u8>>, Error> {
     let mut response = read_headers(stream).await?;
+    log::debug!("Received headers");
     // A response may have a body as long as it is not responding to a HEAD request and as long as
     // the response status code is not 1xx, 204 (no content), or 304 (not modified).
     if !(request_method == http::Method::HEAD
@@ -173,6 +175,7 @@ pub async fn read_from_stream(
         || response.status() == http::StatusCode::NOT_MODIFIED)
     {
         read_body(stream, &mut response).await?;
+        log::debug!("Received body");
     }
     Ok(response)
 }

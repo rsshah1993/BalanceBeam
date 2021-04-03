@@ -71,6 +71,8 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+    /// dead addresses
+    dead_addresses: Vec<String>,
 }
 #[tokio::main]
 async fn main() {
@@ -105,21 +107,8 @@ async fn main() {
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        dead_addresses: Vec::new(),
     };
-
-    // multi-threading for blocking i/o
-    // if options.run_threaded{
-    //     let pool = ThreadPool::new(options.num_threads);
-    //     for stream in listener.incoming() {
-    //         if let Ok(stream) = stream {
-    //             // Handle the connection!
-    //             let state = state.clone();
-    //             pool.execute(move || {
-    //                 handle_connection(stream, &state)
-    //             })
-    //         }
-    //     }
-    // }
 
     // channels to communicate failover for passive health checks
     let (sender, receiver) = crossbeam_channel::unbounded();
@@ -224,6 +213,7 @@ async fn handle_connection(
                     request::Error::IncompleteRequest(_)
                     | request::Error::MalformedRequest(_)
                     | request::Error::InvalidContentLength
+                    | request::Error::UpstreamServerUnavailable
                     | request::Error::ContentLengthMismatch => http::StatusCode::BAD_REQUEST,
                     request::Error::RequestBodyTooLarge => http::StatusCode::PAYLOAD_TOO_LARGE,
                     request::Error::ConnectionError(_) => http::StatusCode::SERVICE_UNAVAILABLE,
