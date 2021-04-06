@@ -5,16 +5,16 @@ use clap::Clap;
 use crossbeam_channel;
 use crossbeam_channel::Sender;
 use rand::{Rng, SeedableRng};
+use std::time::Instant;
 use tokio::task;
 use tokio::{
     net::{TcpListener, TcpStream},
     stream::StreamExt,
 };
-// use threadpool::ThreadPool;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
-#[derive(Clap, Debug)]
+#[derive(Clap, Debug, Clone)]
 #[clap(about = "Fun with load balancing")]
 struct CmdOptions {
     #[clap(
@@ -61,16 +61,17 @@ struct CmdOptions {
 #[derive(Clone)]
 struct ProxyState {
     /// How frequently we check whether upstream servers are alive (Milestone 4)
-    #[allow(dead_code)]
     active_health_check_interval: usize,
     /// Where we should send requests when doing active health checks (Milestone 4)
-    #[allow(dead_code)]
     active_health_check_path: String,
     /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
     #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+    /// dead servers, we can continue to check these and put them back in rotation
+    /// once they return 200 from our active health checks
+    dead_upstream_addresses: Vec<String>,
 }
 #[tokio::main]
 async fn main() {
@@ -105,14 +106,18 @@ async fn main() {
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        dead_upstream_addresses: Vec::new(),
     };
 
     // channels to communicate failover for passive health checks
     let (sender, receiver) = crossbeam_channel::unbounded();
+    let (alive_sender, alive_receiver) = crossbeam_channel::unbounded();
+    let (dead_sender, dead_receiver) = crossbeam_channel::unbounded();
 
-    // async with multiple "threads" (tasks)
+    let state_clone = state.clone();
+    task::spawn(async move { do_health_checks(state_clone, alive_sender, dead_sender) });
+
     while let Some(stream) = listener.next().await {
-        println!("Incoming request!!!!");
         if let Ok(stream) = stream {
             let state = state.clone();
             let sender = sender.clone();
@@ -120,16 +125,110 @@ async fn main() {
                 handle_connection(stream, state, sender).await;
             });
         }
+        // passive health checks
         if let Ok(dead_ip) = receiver.try_recv() {
             log::debug!("Received dead IP index: {}", dead_ip);
             println!("Upstream Addresses: {:?}", state.upstream_addresses);
             let index = state.upstream_addresses.iter().position(|x| *x == dead_ip);
+            // push into dead addresses to check again
+            state.dead_upstream_addresses.push(dead_ip);
             match index {
                 Some(index) => {
                     state.upstream_addresses.remove(index);
                 }
                 None => (),
             }
+        }
+        // active health checks
+        if let Ok(dead_ip) = alive_receiver.try_recv() {
+            log::debug!(
+                "Received dead IP from active health checks index: {}",
+                dead_ip
+            );
+            let index = state.upstream_addresses.iter().position(|x| *x == dead_ip);
+            // push into dead addresses to check again
+            state.dead_upstream_addresses.push(dead_ip);
+            match index {
+                Some(index) => {
+                    state.upstream_addresses.remove(index);
+                }
+                None => (),
+            }
+        }
+
+        if let Ok(alive_ip) = dead_receiver.try_recv() {
+            log::debug!("Dead IP: {} back online", alive_ip);
+            let index = state
+                .dead_upstream_addresses
+                .iter()
+                .position(|x| *x == alive_ip);
+            // push into dead addresses to check again
+            state.upstream_addresses.push(alive_ip);
+            match index {
+                Some(index) => {
+                    state.dead_upstream_addresses.remove(index);
+                }
+                None => (),
+            }
+        }
+    }
+}
+
+async fn do_health_checks(
+    mut state: ProxyState,
+    alive_sender: Sender<String>,
+    dead_sender: Sender<String>,
+) {
+    log::debug!("Starting health checker");
+    // start timer for health check
+    let mut now = Instant::now();
+    loop {
+        if now.elapsed().as_secs() >= state.active_health_check_interval as u64 {
+            let mut active2dead = Vec::new();
+            let mut dead2active = Vec::new();
+            log::debug!("Running health check!");
+
+            // check active servers
+            for (i, server) in state.upstream_addresses.iter().enumerate() {
+                let mut stream = match TcpStream::connect(server).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        log::error!("Could not bind to {}: {}", server, err);
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(_health) =
+                    health_check(&mut stream, server, &state.active_health_check_path).await
+                {
+                    state.dead_upstream_addresses.push(server.clone());
+                    active2dead.push(i);
+                    alive_sender.send(server.clone()).unwrap();
+                }
+            }
+            for i in active2dead {
+                state.upstream_addresses.remove(i);
+            }
+            // check dead servers
+            for (i, server) in state.dead_upstream_addresses.iter().enumerate() {
+                let mut stream = match TcpStream::connect(server).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        log::error!("Could not bind to {}: {}", server, err);
+                        std::process::exit(1);
+                    }
+                };
+                if let Ok(_health) =
+                    health_check(&mut stream, server, &state.active_health_check_path).await
+                {
+                    state.upstream_addresses.push(server.clone());
+                    dead2active.push(i);
+                    dead_sender.send(server.clone()).unwrap();
+                }
+            }
+            for i in dead2active {
+                state.dead_upstream_addresses.remove(i);
+            }
+            now = Instant::now();
         }
     }
 }
@@ -138,7 +237,8 @@ async fn connect_to_upstream(
     state: &mut ProxyState,
     sender: Sender<String>,
 ) -> Result<TcpStream, std::io::Error> {
-    log::debug!("State upstreams per thread: {:?}", state.upstream_addresses);
+    log::info!("State upstreams per thread: {:?}", state.upstream_addresses);
+
     let mut rng = rand::rngs::StdRng::from_entropy();
     let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
     let upstream_ip = { &state.upstream_addresses[upstream_idx] };
@@ -153,6 +253,21 @@ async fn connect_to_upstream(
             Err(error)
         }
     }
+}
+
+async fn health_check(
+    client_conn: &mut TcpStream,
+    upstream: &String,
+    path: &String,
+) -> Result<(), std::io::Error> {
+    // create request
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(path)
+        .header("Host", upstream)
+        .body(Vec::new())
+        .unwrap();
+    request::write_to_stream(&request, client_conn).await
 }
 
 async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>) {
