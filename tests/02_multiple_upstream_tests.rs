@@ -274,12 +274,13 @@ async fn test_rate_limiting() {
             .get(&format!("http://{}/overboard-{}", balancebeam.address, i))
             .header("x-sent-by", "balancebeam-tests")
             .send()
-            .await
-            .expect(
-                "Error sending rate limited request to balancebeam. You should be \
+            .await;
+        println!("{:?}", response);
+        let response = response.expect(
+            "Error sending rate limited request to balancebeam. You should be \
                 accepting the connection but sending back an HTTP error, rather than rejecting \
                 the connection outright.",
-            );
+        );
         log::info!("{:?}", response);
         log::info!("Checking to make sure the server responded with HTTP 429");
         assert_eq!(response.status().as_u16(), 429);

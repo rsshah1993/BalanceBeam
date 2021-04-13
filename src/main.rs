@@ -1,11 +1,12 @@
 mod request;
 mod response;
 
+use ::std::collections::HashMap;
 use clap::Clap;
 use crossbeam_channel;
 use crossbeam_channel::Sender;
 use rand::{Rng, SeedableRng};
-use std::time::Instant;
+use std::{hash::Hash, time::Instant};
 use tokio::task;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -65,7 +66,6 @@ struct ProxyState {
     /// Where we should send requests when doing active health checks (Milestone 4)
     active_health_check_path: String,
     /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
-    #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
@@ -115,9 +115,65 @@ async fn main() {
     let (dead_sender, dead_receiver) = crossbeam_channel::unbounded();
 
     let state_clone = state.clone();
-    task::spawn(async move { do_health_checks(state_clone, alive_sender, dead_sender) });
+    task::spawn(async move { do_health_checks(state_clone, alive_sender, dead_sender).await });
 
-    while let Some(stream) = listener.next().await {
+    let mut rate_limit_table = HashMap::new();
+    let mut rate_limit_timer = Instant::now();
+
+    while let Some(mut stream) = listener.next().await {
+        if state.max_requests_per_minute > 0 {
+            if let Ok(ref mut stream) = stream {
+                let address = stream.local_addr().unwrap();
+                let counter = rate_limit_table.entry(address.clone()).or_insert(0);
+                *counter += 1;
+
+                if counter > &mut state.max_requests_per_minute {
+                    log::error!("Client sent too many requests!");
+                    let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+                    send_response(stream, &response).await;
+                }
+
+                // TODO: test failing because it is receiving a error as response, however this is not happening in the
+                // client when testing manually.
+                if rate_limit_timer.elapsed().as_secs() >= 60 {
+                    rate_limit_table = HashMap::new();
+                    rate_limit_timer = Instant::now();
+                }
+            }
+        }
+
+        // active health checks
+        for dead_ip in alive_receiver.try_iter() {
+            log::error!(
+                "Received dead IP from active health checks index: {}",
+                dead_ip
+            );
+            let index = state.upstream_addresses.iter().position(|x| *x == dead_ip);
+            // push into dead addresses to check again
+            state.dead_upstream_addresses.push(dead_ip);
+            match index {
+                Some(index) => {
+                    state.upstream_addresses.remove(index);
+                }
+                None => (),
+            }
+        }
+        for alive_ip in dead_receiver.try_iter() {
+            log::debug!("Dead IP: {} back online", alive_ip);
+            let index = state
+                .dead_upstream_addresses
+                .iter()
+                .position(|x| *x == alive_ip);
+            // push into dead addresses to check again
+            state.upstream_addresses.push(alive_ip);
+            match index {
+                Some(index) => {
+                    state.dead_upstream_addresses.remove(index);
+                }
+                None => (),
+            }
+        }
+
         if let Ok(stream) = stream {
             let state = state.clone();
             let sender = sender.clone();
@@ -139,38 +195,6 @@ async fn main() {
                 None => (),
             }
         }
-        // active health checks
-        if let Ok(dead_ip) = alive_receiver.try_recv() {
-            log::debug!(
-                "Received dead IP from active health checks index: {}",
-                dead_ip
-            );
-            let index = state.upstream_addresses.iter().position(|x| *x == dead_ip);
-            // push into dead addresses to check again
-            state.dead_upstream_addresses.push(dead_ip);
-            match index {
-                Some(index) => {
-                    state.upstream_addresses.remove(index);
-                }
-                None => (),
-            }
-        }
-
-        if let Ok(alive_ip) = dead_receiver.try_recv() {
-            log::debug!("Dead IP: {} back online", alive_ip);
-            let index = state
-                .dead_upstream_addresses
-                .iter()
-                .position(|x| *x == alive_ip);
-            // push into dead addresses to check again
-            state.upstream_addresses.push(alive_ip);
-            match index {
-                Some(index) => {
-                    state.dead_upstream_addresses.remove(index);
-                }
-                None => (),
-            }
-        }
     }
 }
 
@@ -186,7 +210,7 @@ async fn do_health_checks(
         if now.elapsed().as_secs() >= state.active_health_check_interval as u64 {
             let mut active2dead = Vec::new();
             let mut dead2active = Vec::new();
-            log::debug!("Running health check!");
+            // log::debug!("Running health check!");
 
             // check active servers
             for (i, server) in state.upstream_addresses.iter().enumerate() {
@@ -194,7 +218,9 @@ async fn do_health_checks(
                     Ok(stream) => stream,
                     Err(err) => {
                         log::error!("Could not bind to {}: {}", server, err);
-                        std::process::exit(1);
+                        active2dead.push(i);
+                        alive_sender.send(server.clone()).unwrap();
+                        continue;
                     }
                 };
                 if let Err(_health) =
@@ -289,7 +315,7 @@ async fn handle_connection(
     sender: Sender<String>,
 ) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
-    log::info!("Connection received from {}", client_ip);
+    log::info!("Connection received from s{}", client_ip);
 
     // Open a connection to a random destination server
     let upstream_conn = loop {
